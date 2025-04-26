@@ -1,0 +1,126 @@
+from pyspark.sql import SparkSession
+import os
+
+
+spark = SparkSession.builder.appName("Search Log").getOrCreate()
+
+
+file_path = "searchLog.csv"  
+
+parsed_data = []
+with open(file_path, 'r') as file:
+    for line in file:
+        line = line.strip()
+        if not line.startswith("searchTerm:"):
+            continue
+
+        parts = line.split(",", 1)
+        if len(parts) < 2:
+            continue
+
+        term = parts[0].replace("searchTerm:", "").strip()
+        url_click_pairs = parts[1].split("~") 
+
+        for pair in url_click_pairs:
+            if ":" not in pair:
+                continue
+            url, clicks = pair.rsplit(":", 1)
+            try:
+                parsed_data.append((term, url.strip(), int(clicks.strip())))
+            except ValueError:
+                continue
+
+
+columns = ["term", "url", "clicks"]
+df = spark.createDataFrame(parsed_data, columns)
+
+
+output_dir = "processed_data"
+df.write.mode("overwrite").json(output_dir)
+
+spark.stop()
+
+from flask import Flask, request, jsonify
+from collections import OrderedDict
+import os
+import json
+
+app = Flask(__name__)
+
+# === Load data from JSON files ===
+DATA = []
+for filename in os.listdir("processed_data"):
+    if filename.endswith(".json"):
+        with open(os.path.join("processed_data", filename), 'r') as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    DATA.append(record)
+                except json.JSONDecodeError:
+                    continue
+
+def domain_priority(url):
+    if url.endswith(".org"): return 1
+    if url.endswith(".edu"): return 2
+    if url.endswith(".com"): return 3
+    return 4
+
+# === /results ===
+@app.route('/results', methods=['POST'])
+def results():
+    req = request.get_json()
+    term = req.get('term', '').strip().strip('“”‘’\'"')
+
+    url_clicks = {}
+    for d in DATA:
+        if d["term"].strip().strip('“”‘’\'"') == term:
+            url = d["url"]
+            url_clicks[url] = url_clicks.get(url, 0) + d["clicks"]
+
+    # Sort in this order: alphabetical URL → domain priority → clicks descending
+    sorted_items = sorted(
+        url_clicks.items(),
+        key=lambda x: (x[0], domain_priority(x[0]), -x[1])
+    )
+
+    return jsonify({"results": OrderedDict(sorted_items)})
+
+# === /trends ===
+@app.route('/trends', methods=['POST'])
+def trends():
+    req = request.get_json()
+    term = req.get('term', '').strip().strip('“”‘’\'"')
+    total_clicks = sum(d["clicks"] for d in DATA if d["term"].strip().strip('“”‘’\'"') == term)
+    return jsonify({"clicks": total_clicks})
+
+# === /popularity ===
+@app.route('/popularity', methods=['POST'])
+def popularity():
+    req = request.get_json()
+    url = req.get('url', '').strip()
+    total_clicks = sum(d["clicks"] for d in DATA if d["url"] == url)
+    return jsonify({"clicks": total_clicks})
+
+# === /getBestTerms ===
+@app.route('/getBestTerms', methods=['POST'])
+def get_best_terms():
+    req = request.get_json()
+    website = req.get('website', '').strip()
+
+    entries = [d for d in DATA if d["url"] == website]
+    total = sum(d["clicks"] for d in entries)
+
+    if total == 0:
+        return jsonify({"best_terms": []})
+
+    best_terms = set()
+    for d in entries:
+        term = d["term"].strip().strip('“”‘’\'"')
+        if d["clicks"] > 0.05 * total:
+            best_terms.add(term)
+
+    return jsonify({"best_terms": sorted(best_terms)})
+
+# === Run app ===
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=False)
